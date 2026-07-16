@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# gx reference-transaction — block creating bad branch / tag names
+# Runs on: git branch …, git checkout -b …, git tag …
+# Does NOT block checkout of existing branches (develop, uat, tmp, …).
+# Skipped when GX_SKIP_HOOKS=1 (all gx commands).
+
+set -euo pipefail
+
+HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=gx-validate.sh
+. "$HOOK_DIR/gx-validate.sh"
+
+_gx_hook_skip_if_gx && exit 0
+
+# Only force checks while refs are being prepared
+state="${1:-}"
+[ "$state" = "prepared" ] || exit 0
+
+ZERO="$GX_HOOK_ZERO"
+failed=0
+
+while read -r old_sha new_sha ref; do
+  [ -z "${ref:-}" ] && continue
+  # Only new refs (create). Updates / deletes of existing names are ignored.
+  [ "$old_sha" = "$ZERO" ] || continue
+  [ "$new_sha" = "$ZERO" ] && continue
+
+  case "$ref" in
+    refs/heads/*)
+      branch="${ref#refs/heads/}"
+      if ! _gx_hook_branch_create_ok "$branch"; then
+        _gx_hook_print_branch_create_error "$branch"
+        failed=1
+      fi
+      ;;
+    refs/tags/*)
+      tag="${ref#refs/tags/}"
+      if ! _gx_hook_tag_ok "$tag"; then
+        _gx_hook_print_tag_error "$tag"
+        failed=1
+      fi
+      ;;
+  esac
+done
+
+[ "$failed" -eq 0 ] || exit 1
+exit 0

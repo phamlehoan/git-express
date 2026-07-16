@@ -1,0 +1,1875 @@
+#!/usr/bin/env bash
+# gx — git workflow CLI (portable, no Git-dir customization)
+set -euo pipefail
+
+GX_VERSION="0.0.1"
+
+# ---------------------------------------------------------------------------
+# Paths / config store
+# ---------------------------------------------------------------------------
+_gx_config_home() {
+  if [ -n "${GX_CONFIG_DIR:-}" ]; then
+    printf '%s' "$GX_CONFIG_DIR"
+  elif [ -n "${XDG_CONFIG_HOME:-}" ]; then
+    printf '%s' "$XDG_CONFIG_HOME/gx"
+  else
+    printf '%s' "$HOME/.config/gx"
+  fi
+}
+
+_gx_data_home() {
+  if [ -n "${GX_DATA_DIR:-}" ]; then
+    printf '%s' "$GX_DATA_DIR"
+  elif [ -n "${XDG_DATA_HOME:-}" ]; then
+    printf '%s' "$XDG_DATA_HOME/gx"
+  else
+    printf '%s' "$HOME/.local/share/gx"
+  fi
+}
+
+_gx_script_dir() {
+  local src="${BASH_SOURCE[0]}"
+  # Resolve symlinks when possible
+  if command -v readlink >/dev/null 2>&1; then
+    src="$(readlink -f "$src" 2>/dev/null || readlink "$src" 2>/dev/null || printf '%s' "$src")"
+  fi
+  cd "$(dirname "$src")" && pwd
+}
+
+# Directory containing USAGE.md (installed share/ or repo docs/)
+_gx_docs_dir() {
+  local d cand
+  if [ -n "${GX_DOCS_DIR:-}" ] && [ -f "${GX_DOCS_DIR}/USAGE.md" ]; then
+    printf '%s' "$(_gx_normalize_path "$GX_DOCS_DIR")"
+    return 0
+  fi
+  local cands=()
+  cands+=("$(_gx_data_home)/docs")
+  if [ -n "${LOCALAPPDATA:-}" ]; then
+    cands+=("$(printf '%s' "$LOCALAPPDATA" | tr '\\' '/')/gx/docs")
+  fi
+  local here
+  here="$(_gx_script_dir)"
+  cands+=("$here/../docs" "$here/docs")
+  for cand in "${cands[@]}"; do
+    d="$(_gx_normalize_path "$cand" 2>/dev/null || printf '%s' "$cand")"
+    if [ -f "$d/USAGE.md" ]; then
+      printf '%s' "$d"
+      return 0
+    fi
+  done
+  return 1
+}
+
+_gx_docs_file() {
+  local lang="${1:-en}"
+  local dir name
+  dir="$(_gx_docs_dir)" || return 1
+  case "$lang" in
+    vi|vn|vie) name="USAGE.vi.md" ;;
+    ja|jp|jpn) name="USAGE.ja.md" ;;
+    en|eng|"") name="USAGE.md" ;;
+    *) name="USAGE.md" ;;
+  esac
+  if [ ! -f "$dir/$name" ]; then
+    name="USAGE.md"
+  fi
+  printf '%s/%s' "$dir" "$name"
+}
+
+# Online docs base, e.g. https://github.com/user/gx/blob/main/docs
+_gx_docs_base_url() {
+  local u
+  u="$(_gx_get docs_url "")"
+  if [ -n "$u" ]; then
+    printf '%s' "$u"
+  else
+    # Default online docs (override with: gx cfg global set docs_url '…')
+    printf '%s' "https://github.com/phamlehoan/git-express/blob/main/docs"
+  fi
+}
+
+_gx_docs_web_url() {
+  local lang="${1:-en}"
+  local base name
+  base="$(_gx_docs_base_url)"
+  [ -n "$base" ] || return 1
+  base="${base%/}"
+  case "$lang" in
+    vi|vn|vie) name="USAGE.vi.md" ;;
+    ja|jp|jpn) name="USAGE.ja.md" ;;
+    *) name="USAGE.md" ;;
+  esac
+  printf '%s/%s' "$base" "$name"
+}
+
+_gx_to_file_url() {
+  local p="$1"
+  p=$(printf '%s' "$p" | tr '\\' '/')
+  if [[ "$p" =~ ^/([a-zA-Z])/(.*)$ ]]; then
+    # Git Bash style /c/Users/... → file:///c:/Users/...
+    printf 'file:///%s:/%s' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+  elif [[ "$p" =~ ^([a-zA-Z]):/(.*)$ ]]; then
+    printf 'file:///%s:/%s' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+  else
+    printf 'file://%s' "$p"
+  fi
+}
+
+_gx_open_path_or_url() {
+  local target="$1"
+  local os
+  os=$(uname | tr "[:upper:]" "[:lower:]")
+  case "$os" in
+    mingw*|msys*|cygwin*)
+      if [[ "$target" == file://* ]] || [[ "$target" == http://* ]] || [[ "$target" == https://* ]]; then
+        cmd //c start "" "$target" 2>/dev/null || start "" "$target"
+      else
+        # Windows path or unix path — let start resolve
+        local win="$target"
+        if [[ "$target" =~ ^/([a-zA-Z])/(.*)$ ]]; then
+          win="${BASH_REMATCH[1]}:/${BASH_REMATCH[2]}"
+          win=$(printf '%s' "$win" | tr '/' '\\')
+        fi
+        cmd //c start "" "$win" 2>/dev/null || start "" "$win"
+      fi
+      ;;
+    darwin*)
+      open "$target"
+      ;;
+    *)
+      if [[ "$target" == http://* ]] || [[ "$target" == https://* ]] || [[ "$target" == file://* ]]; then
+        nohup xdg-open "$target" >/dev/null 2>&1 &
+      else
+        nohup xdg-open "$target" >/dev/null 2>&1 &
+      fi
+      ;;
+  esac
+}
+
+_gx_print_docs_links() {
+  local lang="${1:-en}"
+  local file url furl
+  if file="$(_gx_docs_file "$lang" 2>/dev/null)"; then
+    furl="$(_gx_to_file_url "$file")"
+    echo -e "  Local:  \033[1;36m${furl}\033[0m"
+    echo -e "          \033[2m$file\033[0m"
+  else
+    echo -e "  Local:  \033[2m(not installed — re-run ./install.sh)\033[0m"
+  fi
+  if url="$(_gx_docs_web_url "$lang" 2>/dev/null)"; then
+    echo -e "  Online: \033[1;36m${url}\033[0m"
+  else
+    echo -e "  Online: \033[2m(unavailable)\033[0m"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Shared Git hooks (opt-in per repo) — no Node / no Husky
+# ---------------------------------------------------------------------------
+_gx_hooks_share_dir() {
+  local d cand
+  if [ -n "${GX_HOOKS_DIR:-}" ] && [ -f "${GX_HOOKS_DIR}/commit-msg" ]; then
+    printf '%s' "$(_gx_normalize_path "$GX_HOOKS_DIR")"
+    return 0
+  fi
+  local cands=()
+  cands+=("$(_gx_data_home)/hooks")
+  if [ -n "${LOCALAPPDATA:-}" ]; then
+    cands+=("$(printf '%s' "$LOCALAPPDATA" | tr '\\' '/')/gx/hooks")
+  fi
+  local here
+  here="$(_gx_script_dir)"
+  cands+=("$here/../hooks" "$here/hooks")
+  for cand in "${cands[@]}"; do
+    d="$(_gx_normalize_path "$cand" 2>/dev/null || printf '%s' "$cand")"
+    if [ -f "$d/commit-msg" ]; then
+      printf '%s' "$d"
+      return 0
+    fi
+  done
+  return 1
+}
+
+_gx_git_hooks_dir() {
+  local gd
+  gd="$(git rev-parse --git-dir 2>/dev/null)" || {
+    echo -e "\033[1;31m[Error]\033[0m Not inside a git repository." >&2
+    return 1
+  }
+  # Prefer hooksPath if set and under this repo; else .git/hooks
+  local hp
+  hp="$(git config --local --get core.hooksPath 2>/dev/null || true)"
+  if [ -n "$hp" ]; then
+    if [[ "$hp" != /* ]]; then
+      hp="$(_gx_repo_root)/$hp"
+    fi
+    mkdir -p "$hp"
+    printf '%s' "$(_gx_normalize_path "$hp")"
+    return 0
+  fi
+  mkdir -p "$gd/hooks"
+  printf '%s' "$(_gx_normalize_path "$gd/hooks")"
+}
+
+_gx_hooks_marker='# gx-hooks:managed'
+
+_gx_hooks_marker_plain() {
+  printf '%s' 'gx-hooks:managed'
+}
+
+# Install one hook file from share dir → git hooks dir (with marker + backup).
+_gx_hooks_install_file() {
+  local src_dir="$1" dest="$2" name="$3"
+  local hook_src="$src_dir/$name" hook_dst="$dest/$name"
+  if [ ! -f "$hook_src" ]; then
+    echo -e "\033[1;31m[Error]\033[0m Missing hook template: $name" >&2
+    return 1
+  fi
+  if [ -f "$hook_dst" ] && ! grep -q "$(_gx_hooks_marker_plain)" "$hook_dst" 2>/dev/null; then
+    if [ ! -f "$hook_dst.gx-backup" ]; then
+      cp -f "$hook_dst" "$hook_dst.gx-backup"
+      echo -e "\033[1;34m[Info]\033[0m Backed up existing hook → ${name}.gx-backup"
+    fi
+  fi
+  {
+    head -n 1 "$hook_src"
+    echo "${_gx_hooks_marker}"
+    tail -n +2 "$hook_src"
+  } >"$hook_dst"
+  chmod +x "$hook_dst"
+}
+
+_gx_hooks_remove_file() {
+  local dest="$1" name="$2"
+  local hook_dst="$dest/$name"
+  if [ -f "$hook_dst" ] && grep -q "$(_gx_hooks_marker_plain)" "$hook_dst" 2>/dev/null; then
+    rm -f "$hook_dst"
+    if [ -f "$hook_dst.gx-backup" ]; then
+      mv "$hook_dst.gx-backup" "$hook_dst"
+      chmod +x "$hook_dst" 2>/dev/null || true
+      echo -e "\033[1;32m[OK]\033[0m Removed gx ${name}; restored previous hook"
+    else
+      echo -e "\033[1;32m[OK]\033[0m Removed gx ${name}"
+    fi
+    return 0
+  fi
+  return 1
+}
+
+cmd_hooks() {
+  local sub="${1:-status}"
+  shift || true
+
+  case "$sub" in
+    h|help|-h|--help)
+      cat <<'EOF'
+gx hooks — opt-in convention checks (no Node)
+
+  gx hooks on       Enable hooks in this repo
+  gx hooks off      Disable / remove gx-managed hooks
+  gx hooks status   Show whether hooks are enabled
+  gx hooks help
+
+What it checks (plain git / VS Code only):
+  1) Create branch (reference-transaction)
+       git branch / checkout -b → must be type/TICKET-ID
+       or allowlist: develop uat qa staging prod tmp …
+  2) Commit (commit-msg) — auto-format like gx c -m
+       short message → type: description (ticket-id)
+       branch must be type/TICKET-ID (bases OK to checkout, not to commit)
+  3) Push / tags (pre-push + create tag)
+       SemVer style: <env>-vX.Y.Z.N[.hotfixN]
+
+All gx commands set GX_SKIP_HOOKS=1 and use --no-verify where
+supported — hooks never run on the gx path (no wasted time).
+
+Enable only in projects that need it (run inside that repo).
+EOF
+      ;;
+    on|enable|install)
+      local src_dir dest
+      src_dir="$(_gx_hooks_share_dir)" || {
+        echo -e "\033[1;31m[Error]\033[0m Hook templates not found. Re-run ./install.sh" >&2
+        return 1
+      }
+      dest="$(_gx_git_hooks_dir)" || return 1
+      _gx_hooks_install_file "$src_dir" "$dest" "gx-validate.sh" || return 1
+      _gx_hooks_install_file "$src_dir" "$dest" "commit-msg" || return 1
+      _gx_hooks_install_file "$src_dir" "$dest" "pre-push" || return 1
+      _gx_hooks_install_file "$src_dir" "$dest" "reference-transaction" || return 1
+      echo -e "\033[1;32m[OK]\033[0m gx hooks enabled in this repo"
+      echo "     Dir: $dest"
+      echo "     create branch · auto-format commit · push/tags"
+      echo "     gx → always skips hooks (GX_SKIP_HOOKS + --no-verify)"
+      ;;
+    off|disable|uninstall|remove)
+      local dest any=0
+      dest="$(_gx_git_hooks_dir)" || return 1
+      _gx_hooks_remove_file "$dest" "commit-msg" && any=1
+      _gx_hooks_remove_file "$dest" "pre-push" && any=1
+      _gx_hooks_remove_file "$dest" "reference-transaction" && any=1
+      _gx_hooks_remove_file "$dest" "gx-validate.sh" && any=1
+      if [ "$any" -eq 0 ]; then
+        echo -e "\033[1;34m[Info]\033[0m No gx-managed hooks in this repo"
+      fi
+      ;;
+    status|st)
+      local dest cm pp rt
+      dest="$(_gx_git_hooks_dir)" || return 1
+      cm=0
+      pp=0
+      rt=0
+      [ -f "$dest/commit-msg" ] && grep -q "$(_gx_hooks_marker_plain)" "$dest/commit-msg" 2>/dev/null && cm=1
+      [ -f "$dest/pre-push" ] && grep -q "$(_gx_hooks_marker_plain)" "$dest/pre-push" 2>/dev/null && pp=1
+      [ -f "$dest/reference-transaction" ] && grep -q "$(_gx_hooks_marker_plain)" "$dest/reference-transaction" 2>/dev/null && rt=1
+      if [ "$cm" -eq 1 ] || [ "$pp" -eq 1 ] || [ "$rt" -eq 1 ]; then
+        echo -e "\033[1;32m[on]\033[0m  gx hooks are enabled"
+        [ "$rt" -eq 1 ] && echo "     reference-transaction → block bad git branch / checkout -b / tag"
+        [ "$cm" -eq 1 ] && echo "     commit-msg             → auto-format message + require type/TICKET-ID"
+        [ "$pp" -eq 1 ] && echo "     pre-push               → branch + SemVer tags (plain git push)"
+        echo "     gx path always skips hooks"
+        echo "     $dest"
+      else
+        echo -e "\033[1;33m[off]\033[0m gx hooks are not enabled"
+        echo "     Run: gx hooks on"
+      fi
+      local share
+      if share="$(_gx_hooks_share_dir 2>/dev/null)"; then
+        echo "     Templates: $share"
+      fi
+      ;;
+    *)
+      echo -e "\033[1;31m[Error]\033[0m Unknown hooks command: $sub" >&2
+      echo "Run: gx hooks help" >&2
+      return 1
+      ;;
+  esac
+}
+
+_gx_global_file() {
+  printf '%s/global.conf' "$(_gx_config_home)"
+}
+
+_gx_projects_dir() {
+  printf '%s/projects' "$(_gx_config_home)"
+}
+
+_gx_repo_root() {
+  git rev-parse --show-toplevel 2>/dev/null
+}
+
+_gx_normalize_path() {
+  local p="$1"
+  if [ -d "$p" ]; then
+    p="$(cd "$p" && (pwd -P 2>/dev/null || pwd))"
+  fi
+  p=$(printf '%s' "$p" | tr '\\' '/')
+  printf '%s' "$p"
+}
+
+_gx_project_id() {
+  local root="${1:-}"
+  if [ -z "$root" ]; then
+    root="$(_gx_repo_root)" || return 1
+  fi
+  root="$(_gx_normalize_path "$root")"
+  local digest
+  if command -v md5sum >/dev/null 2>&1; then
+    digest=$(printf '%s' "$root" | md5sum | awk '{print $1}')
+  elif command -v md5 >/dev/null 2>&1; then
+    digest=$(printf '%s' "$root" | md5 | awk '{print $NF}')
+  elif command -v openssl >/dev/null 2>&1; then
+    digest=$(printf '%s' "$root" | openssl md5 | awk '{print $NF}')
+  else
+    digest=$(printf '%s' "$root" | cksum | awk '{print $1}')
+  fi
+  printf '%s' "$digest"
+}
+
+_gx_project_file() {
+  local root id
+  root="$(_gx_repo_root)" || {
+    echo -e "\033[1;31m[Error]\033[0m Not inside a git repository." >&2
+    return 1
+  }
+  id="$(_gx_project_id "$root")"
+  mkdir -p "$(_gx_projects_dir)"
+  printf '%s/%s.conf' "$(_gx_projects_dir)" "$id"
+}
+
+_gx_ensure_project_file() {
+  local file root
+  file="$(_gx_project_file)" || return 1
+  root="$(_gx_normalize_path "$(_gx_repo_root)")"
+  if [ ! -f "$file" ]; then
+    mkdir -p "$(dirname "$file")"
+    {
+      echo "path=$root"
+      echo "base=develop"
+      echo "browser=default"
+      echo "tag_env=core-qa"
+      echo "pr_template="
+      echo "repo_name="
+      echo "exclude="
+    } >"$file"
+  else
+    # refresh path if repo moved
+    _gx_conf_set "$file" path "$root"
+  fi
+  printf '%s' "$file"
+}
+
+# KEY=VALUE helpers (value may contain '=')
+_gx_conf_get() {
+  local file="$1" key="$2"
+  [ -f "$file" ] || return 0
+  grep -E "^${key}=" "$file" 2>/dev/null | tail -n1 | sed "s/^${key}=//"
+}
+
+_gx_conf_set() {
+  local file="$1" key="$2" value="${3:-}"
+  local dir tmp
+  dir=$(dirname "$file")
+  mkdir -p "$dir"
+  touch "$file"
+  tmp="${file}.tmp.$$"
+  if grep -qE "^${key}=" "$file" 2>/dev/null; then
+    awk -v k="$key" -v v="$value" '
+      BEGIN { done=0 }
+      index($0, k "=") == 1 {
+        if (!done) { print k "=" v; done=1 }
+        next
+      }
+      { print }
+      END { if (!done) print k "=" v }
+    ' "$file" >"$tmp"
+  else
+    cat "$file" >"$tmp"
+    printf '%s=%s\n' "$key" "$value" >>"$tmp"
+  fi
+  mv "$tmp" "$file"
+}
+
+_gx_conf_unset() {
+  local file="$1" key="$2"
+  [ -f "$file" ] || return 0
+  local tmp="${file}.tmp.$$"
+  grep -vE "^${key}=" "$file" >"$tmp" || true
+  mv "$tmp" "$file"
+}
+
+# Resolve: project key -> global key -> default
+_gx_get() {
+  local key="$1"
+  local default="${2:-}"
+  local pfile gfile val
+  gfile="$(_gx_global_file)"
+  if pfile="$(_gx_project_file 2>/dev/null)"; then
+    if [ -f "$pfile" ]; then
+      val="$(_gx_conf_get "$pfile" "$key")"
+      if [ -n "$val" ]; then
+        printf '%s' "$val"
+        return 0
+      fi
+    fi
+  fi
+  if [ -f "$gfile" ]; then
+    val="$(_gx_conf_get "$gfile" "$key")"
+    if [ -n "$val" ]; then
+      printf '%s' "$val"
+      return 0
+    fi
+  fi
+  printf '%s' "$default"
+}
+
+_gx_base_branch() {
+  _gx_get base develop
+}
+
+# ---------------------------------------------------------------------------
+# Clipboard
+# ---------------------------------------------------------------------------
+_gx_clip() {
+  if command -v clip >/dev/null 2>&1; then
+    clip
+  elif command -v pbcopy >/dev/null 2>&1; then
+    pbcopy
+  elif command -v xclip >/dev/null 2>&1; then
+    xclip -selection clipboard
+  elif command -v xsel >/dev/null 2>&1; then
+    xsel --clipboard --input
+  elif command -v wl-copy >/dev/null 2>&1; then
+    wl-copy
+  else
+    echo -e "\033[1;31m[Error]\033[0m No clipboard tool found (clip/pbcopy/xclip/xsel/wl-copy)." >&2
+    return 1
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# PR helpers (remote-aware, config optional)
+# ---------------------------------------------------------------------------
+_get_target_branch() {
+  local env="$1"
+  local base mapped
+  base="$(_gx_base_branch)"
+
+  if [ -z "$env" ] || [ "$env" = "$base" ]; then
+    echo "$base"
+    return
+  fi
+
+  mapped="$(_gx_get "branch.${env}" "")"
+  if [ -n "$mapped" ]; then
+    echo "$mapped"
+  else
+    echo "$env"
+  fi
+}
+
+_gx_origin_url() {
+  git remote get-url origin 2>/dev/null || git config --get remote.origin.url 2>/dev/null || true
+}
+
+# Normalize clone URL → https://host/path (no .git)
+_gx_remote_web_base() {
+  local raw="$1"
+  local url="$raw"
+
+  # Backlog SSH: SPACE@git.backlog.com:/PROJ/repo.git → https://SPACE.backlog.com/git/PROJ/repo
+  if [[ "$url" =~ ^([^@]+)@git\.(backlog\.(com|jp)|backlogtool\.com):/*(.+)$ ]]; then
+    url="https://${BASH_REMATCH[1]}.${BASH_REMATCH[2]}/git/${BASH_REMATCH[4]}"
+  # Backlog SSH alt: SPACE@SPACE.git.backlog.com:/PROJ/repo.git
+  elif [[ "$url" =~ ^([^@]+)@([^.]+)\.git\.(backlog\.(com|jp)|backlogtool\.com):/*(.+)$ ]]; then
+    url="https://${BASH_REMATCH[1]}.${BASH_REMATCH[3]}/git/${BASH_REMATCH[5]}"
+  # user@host:path (incl. git@host:path) → https://host/path
+  elif [[ "$url" =~ ^[^@]+@([^:]+):(.+)$ ]]; then
+    local p="${BASH_REMATCH[2]}"
+    p="${p#/}"
+    url="https://${BASH_REMATCH[1]}/${p}"
+  # ssh://git@host/path
+  elif [[ "$url" =~ ^ssh://([^@]+@)?([^/]+)/(.+)$ ]]; then
+    url="https://${BASH_REMATCH[2]}/${BASH_REMATCH[3]}"
+  # git://host/path
+  elif [[ "$url" =~ ^git://([^/]+)/(.+)$ ]]; then
+    url="https://${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+  fi
+
+  url="${url%.git}"
+  url="${url%/}"
+  printf '%s' "$url"
+}
+
+# Build PR/MR URL from origin remote. Prints URL or returns 1.
+_gx_pr_url_from_remote() {
+  local source_branch="$1"
+  local target_branch="$2"
+  local remote web host path
+  local src_encoded tgt_encoded
+  local repo_name region
+  local space domain project repo
+
+  remote="$(_gx_origin_url)"
+  if [ -z "$remote" ]; then
+    return 1
+  fi
+
+  src_encoded=$(printf '%s' "$source_branch" | sed "s/\//%2F/g")
+  tgt_encoded=$(printf '%s' "$target_branch" | sed "s/\//%2F/g")
+
+  # Nulab Backlog — prefer raw remote (SSH host differs from web host)
+  # HTTPS: https://SPACE.backlog.com/git/PROJECT/REPO.git
+  # SSH:   SPACE@git.backlog.com:/PROJECT/REPO.git
+  if [[ "$remote" =~ ^https?://([^.]+)\.(backlog\.(com|jp)|backlogtool\.com)/git/([^/]+)/([^/]+)(\.git)?/?$ ]]; then
+    space="${BASH_REMATCH[1]}"
+    domain="${BASH_REMATCH[2]}"
+    project="${BASH_REMATCH[4]}"
+    repo="${BASH_REMATCH[5]}"
+    repo="${repo%.git}"
+    printf 'https://%s.%s/git/%s/%s/pullRequests/add/%s...%s' \
+      "$space" "$domain" "$project" "$repo" "$target_branch" "$source_branch"
+    return 0
+  fi
+  if [[ "$remote" =~ ^([^@]+)@git\.(backlog\.(com|jp)|backlogtool\.com):/*([^/]+)/([^/]+)(\.git)?/?$ ]]; then
+    space="${BASH_REMATCH[1]}"
+    domain="${BASH_REMATCH[2]}"
+    project="${BASH_REMATCH[4]}"
+    repo="${BASH_REMATCH[5]}"
+    repo="${repo%.git}"
+    printf 'https://%s.%s/git/%s/%s/pullRequests/add/%s...%s' \
+      "$space" "$domain" "$project" "$repo" "$target_branch" "$source_branch"
+    return 0
+  fi
+  if [[ "$remote" =~ ^([^@]+)@([^.]+)\.git\.(backlog\.(com|jp)|backlogtool\.com):/*([^/]+)/([^/]+)(\.git)?/?$ ]]; then
+    space="${BASH_REMATCH[1]}"
+    domain="${BASH_REMATCH[3]}"
+    project="${BASH_REMATCH[5]}"
+    repo="${BASH_REMATCH[6]}"
+    repo="${repo%.git}"
+    printf 'https://%s.%s/git/%s/%s/pullRequests/add/%s...%s' \
+      "$space" "$domain" "$project" "$repo" "$target_branch" "$source_branch"
+    return 0
+  fi
+
+  web="$(_gx_remote_web_base "$remote")"
+
+  # AWS CodeCommit: https://git-codecommit.REGION.amazonaws.com/v1/repos/NAME
+  if [[ "$web" =~ git-codecommit\.([a-z0-9-]+)\.amazonaws\.com/v1/repos/([^/]+)$ ]]; then
+    region="${BASH_REMATCH[1]}"
+    repo_name="${BASH_REMATCH[2]}"
+    local override
+    override="$(_gx_get repo_name "")"
+    [ -n "$override" ] && repo_name="$override"
+    printf 'https://%s.console.aws.amazon.com/codesuite/codecommit/repositories/%s/pull-requests/new/refs/heads/%s/.../refs/heads/%s?region=%s' \
+      "$region" "$repo_name" "$target_branch" "$source_branch" "$region"
+    return 0
+  fi
+
+  # Strip scheme for host/path split
+  if [[ "$web" =~ ^https?://([^/]+)/(.+)$ ]]; then
+    host="${BASH_REMATCH[1]}"
+    path="${BASH_REMATCH[2]}"
+  else
+    return 1
+  fi
+
+  # GitHub (github.com or GitHub Enterprise *.ghe.com / common enterprise hosts)
+  if [[ "$host" == "github.com" || "$host" == *".ghe.com" || "$host" == "gist.github.com" ]]; then
+    # compare/base...head opens PR create UI
+    printf 'https://%s/%s/compare/%s...%s?expand=1' "$host" "$path" "$tgt_encoded" "$src_encoded"
+    return 0
+  fi
+
+  # GitLab (gitlab.com or self-hosted with "gitlab" in host)
+  if [[ "$host" == "gitlab.com" || "$host" == *gitlab* ]]; then
+    printf 'https://%s/%s/-/merge_requests/new?merge_request%%5Bsource_branch%%5D=%s&merge_request%%5Btarget_branch%%5D=%s' \
+      "$host" "$path" "$src_encoded" "$tgt_encoded"
+    return 0
+  fi
+
+  # Bitbucket Cloud
+  if [[ "$host" == "bitbucket.org" ]]; then
+    printf 'https://%s/%s/pull-requests/new?source=%s&dest=%s' \
+      "$host" "$path" "$src_encoded" "$tgt_encoded"
+    return 0
+  fi
+
+  # Azure DevOps: dev.azure.com/org/project/_git/repo
+  if [[ "$host" == "dev.azure.com" || "$host" == "ssh.dev.azure.com" ]]; then
+    if [[ "$path" =~ ^([^/]+)/([^/]+)/_git/([^/]+)$ ]]; then
+      printf 'https://dev.azure.com/%s/%s/_git/%s/pullrequestcreate?sourceRef=%s&targetRef=%s' \
+        "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" \
+        "$src_encoded" "$tgt_encoded"
+      return 0
+    fi
+  fi
+  # legacy visualstudio.com
+  if [[ "$host" == *.visualstudio.com ]]; then
+    printf 'https://%s/%s/pullrequestcreate?sourceRef=%s&targetRef=%s' \
+      "$host" "$path" "$src_encoded" "$tgt_encoded"
+    return 0
+  fi
+
+  return 1
+}
+
+_pr_logic() {
+  local env="$1"
+  local force_flag="${2:-}"
+  local target_branch source_branch current_branch
+  local repo_name template url
+  local src_encoded tgt_encoded
+
+  target_branch="$(_get_target_branch "$env")"
+  current_branch=$(git branch --show-current)
+  source_branch="$current_branch"
+
+  # protect.<env> = forced source unless -f
+  if [ "$force_flag" != "-f" ]; then
+    local protected
+    protected="$(_gx_get "protect.${env}" "")"
+    if [ -n "$protected" ]; then
+      source_branch="$protected"
+    fi
+  fi
+
+  repo_name="$(_gx_get repo_name "")"
+  if [ -z "$repo_name" ]; then
+    repo_name=$(basename "$(_gx_repo_root)")
+  fi
+
+  # Optional override template wins; otherwise infer from origin remote
+  template="$(_gx_get pr_template "")"
+  if [ -n "$template" ]; then
+    src_encoded=$(printf '%s' "$source_branch" | sed "s/\//%2F/g")
+    tgt_encoded=$(printf '%s' "$target_branch" | sed "s/\//%2F/g")
+    url="$template"
+    url="${url//\{source\}/$src_encoded}"
+    url="${url//\{target\}/$tgt_encoded}"
+    url="${url//\{source_raw\}/$source_branch}"
+    url="${url//\{target_raw\}/$target_branch}"
+    url="${url//\{repo\}/$repo_name}"
+    printf '%s' "$url"
+    return 0
+  fi
+
+  if url="$(_gx_pr_url_from_remote "$source_branch" "$target_branch")"; then
+    local remote
+    remote="$(_gx_origin_url)"
+    echo -e "\033[1;34m[PR]\033[0m Inferred from remote: \033[1;33m$remote\033[0m" >&2
+    printf '%s' "$url"
+    return 0
+  fi
+
+  echo -e "\033[1;31m[Error]\033[0m Cannot build PR URL from remote." >&2
+  echo -e "  Remote: \033[1;33m$(_gx_origin_url || echo '(none)')\033[0m" >&2
+  echo -e "  Supported: GitHub, GitLab, Bitbucket, Azure DevOps, AWS CodeCommit, Nulab Backlog." >&2
+  echo -e "  Or set: \033[1;33mgx cfg set pr_template 'https://.../{source}/.../{target}'\033[0m" >&2
+  return 1
+}
+
+_open_url_browser() {
+  local url=$1
+  local browser
+  browser="$(_gx_get browser default)"
+  local os
+  os=$(uname | tr "[:upper:]" "[:lower:]")
+
+  case "$browser" in
+    edge)
+      echo -e "\033[1;36m[Browser]\033[0m Opening in \033[1;34mMicrosoft Edge\033[0m..."
+      case "$os" in
+        mingw*|msys*|cygwin*)
+          start msedge "$url" 2>/dev/null || powershell.exe -Command "Start-Process 'msedge' '$url'"
+          ;;
+        darwin*)
+          open -a "Microsoft Edge" "$url"
+          ;;
+        *)
+          microsoft-edge "$url" 2>/dev/null || xdg-open "$url"
+          ;;
+      esac
+      ;;
+    chrome)
+      echo -e "\033[1;36m[Browser]\033[0m Opening in \033[1;32mGoogle Chrome\033[0m..."
+      case "$os" in
+        mingw*|msys*|cygwin*) start chrome "$url" ;;
+        darwin*) open -a "Google Chrome" "$url" ;;
+        *) google-chrome "$url" 2>/dev/null || chromium-browser "$url" 2>/dev/null || xdg-open "$url" ;;
+      esac
+      ;;
+    coccoc)
+      echo -e "\033[1;36m[Browser]\033[0m Opening in \033[1;33mCoc Coc\033[0m..."
+      case "$os" in
+        mingw*|msys*|cygwin*)
+          local coccoc_exe_home="$HOME/AppData/Local/CocCoc/Browser/Application/browser.exe"
+          if [ -f "$coccoc_exe_home" ]; then
+            "$coccoc_exe_home" "$url"
+          else
+            start "" "$url"
+          fi
+          ;;
+        darwin*)
+          open -a "CocCoc" "$url" 2>/dev/null || open "$url"
+          ;;
+        *)
+          if command -v coccoc-browser >/dev/null 2>&1; then
+            coccoc-browser "$url"
+          else
+            xdg-open "$url"
+          fi
+          ;;
+      esac
+      ;;
+    default|*)
+      case "$os" in
+        mingw*|msys*|cygwin*) start "" "$url" ;;
+        darwin*) open "$url" ;;
+        *) nohup xdg-open "$url" >/dev/null 2>&1 & ;;
+      esac
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Commit message helpers
+# ---------------------------------------------------------------------------
+_normalize_commit_msg() {
+  local msg="$1"
+  msg=$(printf '%s' "$msg" | sed 's/\([a-z0-9]\)\([A-Z]\)/\1_\2/g' | sed 's/\([A-Z]\)\([A-Z][a-z]\)/\1_\2/g' | tr '[:upper:]' '[:lower:]')
+  msg=$(printf '%s' "$msg" | sed 's/[[:space:]]\+/ /g' | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//')
+  printf '%s' "$msg"
+}
+
+_format_commit_message() {
+  local purpose="$1"
+  local raw_msg="$2"
+  local ticket_id="$3"
+  local normalized_msg
+  normalized_msg=$(_normalize_commit_msg "$raw_msg")
+
+  if [ -n "$ticket_id" ]; then
+    printf '%s: %s (%s)' "$purpose" "$normalized_msg" "$ticket_id"
+  else
+    printf '%s: %s' "$purpose" "$normalized_msg"
+  fi
+}
+
+_smart_add() {
+  if git diff --cached --quiet; then
+    echo -e "\033[1;34m[Info]\033[0m No files staged. Running 'gx a' (git add .)..."
+    cmd_a
+  else
+    echo -e "\033[1;32m[Info]\033[0m Files already staged. Keeping your selection."
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Rebase workflow
+# ---------------------------------------------------------------------------
+_print_rebase_result() {
+  local branch
+  branch=$(git branch --show-current)
+  local rebase_output="$1"
+  local bg_color txt_color status_text icon detail
+
+  if echo "$rebase_output" | grep -iq "conflict"; then
+    bg_color="\033[41;1m"
+    txt_color="\033[1;31m"
+    status_text=" CONFLICT DETECTED "
+    icon="⚠️ "
+    detail="Manual resolution required!"
+  elif echo "$rebase_output" | grep -iqE "is up to date|already up to date"; then
+    bg_color="\033[46;1m"
+    txt_color="\033[1;36m"
+    status_text=" ALREADY UP TO DATE "
+    icon="✨"
+    detail="Your branch is already at the latest version."
+  else
+    bg_color="\033[42;1m"
+    txt_color="\033[1;32m"
+    status_text=" REBASE SUCCESSFUL "
+    icon="🚀"
+    detail="Branch updated with new commits."
+  fi
+
+  echo -e "\n${bg_color}\033[30m ${icon}${status_text}\033[0m ${txt_color}󱐋 \033[1;33m${branch}\033[0m"
+  echo -e "${txt_color}╰─> ${detail}\033[0m\n"
+}
+
+_git_rebase_workflow() {
+  local target_branch="${1:-$(_gx_base_branch)}"
+  local should_delete_local="${2:-false}"
+
+  echo -e "\033[1;34m[Workflow]\033[0m Rebasing on: \033[1;33m$target_branch\033[0m"
+
+  local stashed=false
+  if ! git diff --quiet || ! git diff --cached --quiet; then
+    echo -e "\033[1;34m[Workflow]\033[0m Local changes detected. Stashing..."
+    git stash push -m "temp_stash_for_rebase"
+    stashed=true
+  fi
+
+  if [ "$should_delete_local" = true ] && [ "$target_branch" != "$(git branch --show-current)" ]; then
+    git branch -D "$target_branch" 2>/dev/null || true
+  fi
+  git fetch origin "$target_branch":"$target_branch"
+
+  local rb_result rb_exit
+  set +e
+  rb_result=$(git rebase "$target_branch" 2>&1)
+  rb_exit=$?
+  set -e
+  echo "$rb_result"
+
+  if [ "$rb_exit" -ne 0 ]; then
+    _print_rebase_result "$rb_result"
+    return 1
+  fi
+
+  if [ "$stashed" = true ]; then
+    echo -e "\033[1;34m[Workflow]\033[0m Restoring your temporary stash..."
+    if ! git stash pop; then
+      echo -e "\n\033[1;31m⚠️  CONFLICT WHILE RESTORING STASH!\033[0m"
+      return 1
+    fi
+  fi
+
+  cmd_l -5
+  _print_rebase_result "$rb_result"
+}
+
+# ---------------------------------------------------------------------------
+# Config commands
+# ---------------------------------------------------------------------------
+_gx_cfg_print_help() {
+  cat <<'EOF'
+gx cfg — per-project configuration
+
+  gx cfg                     Show config for current repo
+  gx cfg list                List remembered projects
+  gx cfg init                Create/reset config for current repo
+  gx cfg set <key> <value>   Set a project key
+  gx cfg get <key>           Get a key (project → global → default)
+  gx cfg unset <key>         Remove a project key
+  gx cfg global set|get|unset <key> [value]
+  gx cfg branch <alias> <branch>     Map env alias → target branch
+  gx cfg protect <alias> <branch>    Default PR source (unless -f)
+  gx cfg exclude add <path>          Unstage path after gx a
+  gx cfg exclude rm <path>
+  gx cfg exclude list
+  gx cfg path                Show config file path
+  gx cfg edit                Open project config in $EDITOR
+
+Keys:
+  base          Default rebase / PR target (default: develop)
+  browser       default | chrome | edge | coccoc
+  pr_template   Optional override URL ({source} {target} {source_raw} {target_raw} {repo})
+                If unset, gx infers PR/MR link from git remote origin
+  docs_url      Online docs base for gx h / gx docs
+                e.g. https://github.com/phamlehoan/git-express/blob/main/docs
+  repo_name     Override repo name (CodeCommit / template {repo})
+  tag_env       Default env for gx t / gx tn
+  exclude       Paths to unstage after add (| separated)
+  branch.*      Env alias → real target branch
+  protect.*     Env alias → forced source branch for PR
+
+PR auto-detect (from origin):
+  GitHub, GitLab, Bitbucket Cloud, Azure DevOps, AWS CodeCommit, Nulab Backlog
+
+Placeholders in pr_template (override only):
+  {source} / {target}          URL-encoded branch names
+  {source_raw} / {target_raw}  Literal branch names
+  {repo}                       repo_name or folder basename
+EOF
+}
+
+_gx_cfg_show() {
+  local file
+  file="$(_gx_ensure_project_file)" || return 1
+  echo -e "\033[1;34m[Config]\033[0m $file"
+  echo -e "\033[1;33m--- project ---\033[0m"
+  if [ -s "$file" ]; then
+    cat "$file"
+  else
+    echo "(empty)"
+  fi
+  local gfile
+  gfile="$(_gx_global_file)"
+  if [ -f "$gfile" ]; then
+    echo -e "\n\033[1;33m--- global ---\033[0m"
+    cat "$gfile"
+  fi
+}
+
+_gx_cfg_list() {
+  local dir
+  dir="$(_gx_projects_dir)"
+  if [ ! -d "$dir" ] || [ -z "$(ls -A "$dir" 2>/dev/null || true)" ]; then
+    echo "No projects configured yet. Run 'gx cfg init' inside a repo."
+    return 0
+  fi
+  local f path id
+  printf '%-12s  %s\n' "ID" "PATH"
+  for f in "$dir"/*.conf; do
+    [ -f "$f" ] || continue
+    id=$(basename "$f" .conf)
+    path="$(_gx_conf_get "$f" path)"
+    printf '%-12s  %s\n' "${id:0:12}" "${path:-(unknown)}"
+  done
+}
+
+_gx_cfg_init() {
+  local file
+  file="$(_gx_ensure_project_file)" || return 1
+  echo -e "\033[1;32m[OK]\033[0m Project config ready: \033[1;33m$file\033[0m"
+  echo ""
+  echo "Next steps (optional — PR URL is inferred from origin remote):"
+  echo "  gx cfg set browser chrome"
+  echo "  gx cfg set base develop"
+  echo "  gx cfg branch qa release"
+  echo "  gx cfg protect qa develop"
+  echo "  gx cfg exclude add path/to/file.json"
+  echo "  # override PR URL only if remote is unsupported:"
+  echo "  # gx cfg set pr_template 'https://.../{source}/.../{target}'"
+  echo ""
+  _gx_cfg_show
+}
+
+_gx_exclude_list_raw() {
+  _gx_get exclude ""
+}
+
+_gx_exclude_add() {
+  local path="$1"
+  local file cur
+  file="$(_gx_ensure_project_file)" || return 1
+  cur="$(_gx_conf_get "$file" exclude)"
+  if [ -z "$cur" ]; then
+    _gx_conf_set "$file" exclude "$path"
+  elif [[ "|$cur|" == *"|$path|"* ]]; then
+    echo -e "\033[1;34m[Info]\033[0m Already in exclude: $path"
+    return 0
+  else
+    _gx_conf_set "$file" exclude "${cur}|${path}"
+  fi
+  echo -e "\033[1;32m[OK]\033[0m exclude += $path"
+}
+
+_gx_exclude_rm() {
+  local path="$1"
+  local file cur next part
+  file="$(_gx_ensure_project_file)" || return 1
+  cur="$(_gx_conf_get "$file" exclude)"
+  next=""
+  IFS='|' read -ra parts <<<"$cur"
+  for part in "${parts[@]+"${parts[@]}"}"; do
+    [ -z "$part" ] && continue
+    if [ "$part" = "$path" ]; then
+      continue
+    fi
+    if [ -z "$next" ]; then
+      next="$part"
+    else
+      next="${next}|${part}"
+    fi
+  done
+  _gx_conf_set "$file" exclude "$next"
+  echo -e "\033[1;32m[OK]\033[0m exclude -= $path"
+}
+
+cmd_cfg() {
+  local sub="${1:-show}"
+  shift || true
+
+  case "$sub" in
+    h|help|-h|--help)
+      _gx_cfg_print_help
+      ;;
+    show|"")
+      _gx_cfg_show
+      ;;
+    list|ls)
+      _gx_cfg_list
+      ;;
+    init)
+      _gx_cfg_init
+      ;;
+    path)
+      _gx_project_file
+      ;;
+    edit)
+      local file
+      file="$(_gx_ensure_project_file)" || return 1
+      ${EDITOR:-vi} "$file"
+      ;;
+    get)
+      if [ -z "${1:-}" ]; then
+        echo "Usage: gx cfg get <key>" >&2
+        return 1
+      fi
+      _gx_get "$1" ""
+      echo
+      ;;
+    set)
+      if [ -z "${1:-}" ] || [ -z "${2:-}" ]; then
+        echo "Usage: gx cfg set <key> <value>" >&2
+        return 1
+      fi
+      local file key value
+      file="$(_gx_ensure_project_file)" || return 1
+      key="$1"
+      shift
+      value="$*"
+      _gx_conf_set "$file" "$key" "$value"
+      echo -e "\033[1;32m[OK]\033[0m $key=$value"
+      ;;
+    unset)
+      if [ -z "${1:-}" ]; then
+        echo "Usage: gx cfg unset <key>" >&2
+        return 1
+      fi
+      local file
+      file="$(_gx_ensure_project_file)" || return 1
+      _gx_conf_unset "$file" "$1"
+      echo -e "\033[1;32m[OK]\033[0m unset $1"
+      ;;
+    global)
+      local gsub="${1:-}"
+      shift || true
+      local gfile
+      gfile="$(_gx_global_file)"
+      mkdir -p "$(dirname "$gfile")"
+      touch "$gfile"
+      case "$gsub" in
+        get)
+          _gx_conf_get "$gfile" "${1:-}"
+          echo
+          ;;
+        set)
+          if [ -z "${1:-}" ] || [ -z "${2:-}" ]; then
+            echo "Usage: gx cfg global set <key> <value>" >&2
+            return 1
+          fi
+          local gk gv
+          gk="$1"
+          shift
+          gv="$*"
+          _gx_conf_set "$gfile" "$gk" "$gv"
+          echo -e "\033[1;32m[OK]\033[0m global $gk=$gv"
+          ;;
+        unset)
+          _gx_conf_unset "$gfile" "$1"
+          echo -e "\033[1;32m[OK]\033[0m global unset $1"
+          ;;
+        show|"")
+          echo -e "\033[1;34m[Global]\033[0m $gfile"
+          cat "$gfile" 2>/dev/null || true
+          ;;
+        *)
+          echo "Usage: gx cfg global set|get|unset|show ..." >&2
+          return 1
+          ;;
+      esac
+      ;;
+    branch)
+      if [ -z "${1:-}" ] || [ -z "${2:-}" ]; then
+        echo "Usage: gx cfg branch <alias> <target-branch>" >&2
+        return 1
+      fi
+      local file
+      file="$(_gx_ensure_project_file)" || return 1
+      _gx_conf_set "$file" "branch.$1" "$2"
+      echo -e "\033[1;32m[OK]\033[0m branch.$1=$2"
+      ;;
+    protect)
+      if [ -z "${1:-}" ] || [ -z "${2:-}" ]; then
+        echo "Usage: gx cfg protect <alias> <source-branch>" >&2
+        return 1
+      fi
+      local file
+      file="$(_gx_ensure_project_file)" || return 1
+      _gx_conf_set "$file" "protect.$1" "$2"
+      echo -e "\033[1;32m[OK]\033[0m protect.$1=$2"
+      ;;
+    exclude)
+      local esub="${1:-list}"
+      shift || true
+      case "$esub" in
+        list|ls|show)
+          local ex
+          ex="$(_gx_exclude_list_raw)"
+          if [ -z "$ex" ]; then
+            echo "(no excludes)"
+          else
+            echo "$ex" | tr '|' '\n'
+          fi
+          ;;
+        add)
+          [ -n "${1:-}" ] || { echo "Usage: gx cfg exclude add <path>" >&2; return 1; }
+          _gx_exclude_add "$1"
+          ;;
+        rm|remove|del)
+          [ -n "${1:-}" ] || { echo "Usage: gx cfg exclude rm <path>" >&2; return 1; }
+          _gx_exclude_rm "$1"
+          ;;
+        *)
+          echo "Usage: gx cfg exclude list|add|rm ..." >&2
+          return 1
+          ;;
+      esac
+      ;;
+    *)
+      echo -e "\033[1;31m[Error]\033[0m Unknown cfg subcommand: $sub" >&2
+      _gx_cfg_print_help
+      return 1
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+cmd_a() {
+  git add .
+  local exclude part
+  exclude="$(_gx_exclude_list_raw)"
+  if [ -n "$exclude" ]; then
+    echo -e "\033[1;33m[Git]\033[0m Unstaging configured excludes..."
+    IFS='|' read -ra parts <<<"$exclude"
+    for part in "${parts[@]+"${parts[@]}"}"; do
+      [ -z "$part" ] && continue
+      git restore --staged "$part" 2>/dev/null || true
+    done
+  fi
+}
+
+_build_commit_msg_from_branch() {
+  # $1 = raw message from user
+  local raw="$1"
+  local current_branch purpose remainder userstory_id formatted_id
+  current_branch=$(git branch --show-current)
+  if [[ "$current_branch" == *"/"* ]]; then
+    purpose="${current_branch%%/*}"
+    remainder="${current_branch#*/}"
+    userstory_id="${remainder%%/*}"
+    formatted_id=$(echo "$userstory_id" | tr '[:upper:]' '[:lower:]')
+    _format_commit_message "$purpose" "$raw" "$formatted_id"
+  else
+    _normalize_commit_msg "$raw"
+  fi
+}
+
+_gx_parse_c_args() {
+  # Sets: _GX_C_AMEND (true/false), _GX_C_MSG (raw or empty)
+  _GX_C_AMEND=false
+  _GX_C_MSG=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --amend)
+        _GX_C_AMEND=true
+        shift
+        ;;
+      -m|--message)
+        shift
+        if [ -z "${1:-}" ]; then
+          echo -e "\033[1;31m[Error]\033[0m -m requires a message." >&2
+          return 1
+        fi
+        _GX_C_MSG="$1"
+        shift
+        ;;
+      --message=*)
+        _GX_C_MSG="${1#--message=}"
+        shift
+        ;;
+      -m*)
+        _GX_C_MSG="${1#-m}"
+        shift
+        ;;
+      -h|--help)
+        cat <<'EOF'
+gx c — commit (auto-format from branch)
+
+  gx c -m "message"              New commit; message auto-formatted
+  gx c                           Amend last commit (keep message)
+  gx c --amend                   Same as gx c
+  gx c --amend -m "message"      Amend and set new auto-formatted message
+
+Format (branch feat/ABC-123 + -m "AddLoginFilter"):
+  → feat: add_login_filter (abc-123)
+  ABC-123 = ticket / issue ID from your tracker
+EOF
+        return 2
+        ;;
+      *)
+        echo -e "\033[1;31m[Error]\033[0m Unknown argument: $1" >&2
+        echo "Usage: gx c [-m \"message\"] [--amend]" >&2
+        return 1
+        ;;
+    esac
+  done
+  return 0
+}
+
+cmd_c() {
+  local rc
+  set +e
+  _gx_parse_c_args "$@"
+  rc=$?
+  set -e
+  if [ "$rc" -eq 2 ]; then
+    return 0
+  fi
+  if [ "$rc" -ne 0 ]; then
+    return "$rc"
+  fi
+
+  local amend="$_GX_C_AMEND"
+  local raw="$_GX_C_MSG"
+  local msg
+
+  # No -m and no explicit flags beyond default → amend (gx c)
+  # --amend without -m → amend keep message
+  # -m without --amend → new commit
+  # --amend -m → amend with new message
+
+  if [ -z "$raw" ]; then
+    # amend keep message (gx c  |  gx c --amend)
+    git commit --amend -m "$(git log -1 --format=%s)" --no-verify \
+      && echo -e "\033[1;32mCommit amended: \033[1;33m$(git log -1 --format=%s)\033[0m"
+    return $?
+  fi
+
+  msg="$(_build_commit_msg_from_branch "$raw")"
+
+  if [ "$amend" = true ]; then
+    git commit --amend -m "$msg" --no-verify \
+      && echo -e "\033[1;32mCommit amended: \033[1;33m$(git log -1 --format=%s)\033[0m"
+  else
+    git commit -m "$msg" --no-verify \
+      && echo -e "\033[1;32mNew commit: \033[1;33m$(git log -1 --format=%s)\033[0m"
+  fi
+}
+
+cmd_ca() {
+  # Alias kept for convenience → same as gx c --amend
+  cmd_c --amend
+}
+
+cmd_f() {
+  _git_rebase_workflow "${1:-$(_gx_base_branch)}" true
+}
+
+cmd_p() {
+  git push --no-verify origin "$(git branch --show-current)" "$@"
+}
+
+# Same rules as hooks/reference-transaction (cheap; no hook process).
+_gx_branch_create_ok() {
+  local b="$1"
+  case "$b" in
+    main|master|develop|trunk|dev|staging|production|prod|qa|uat|tmp|test|sandbox|release)
+      return 0
+      ;;
+  esac
+  if echo "$b" | grep -Eq '^(release|hotfix)(/|-)'; then
+    return 0
+  fi
+  echo "$b" | grep -Eq '^(feat|fix|hotfix|chore|docs|refactor|test|ci|build|perf|style|revert)/[A-Za-z0-9._-]+$'
+}
+
+cmd_co() {
+  # Validate -b / --branch here so gx never relies on hooks for naming.
+  local -a args=("$@")
+  local i name=""
+  for ((i = 0; i < ${#args[@]}; i++)); do
+    case "${args[$i]}" in
+      -b|--branch)
+        name="${args[$((i + 1))]:-}"
+        break
+        ;;
+      --branch=*)
+        name="${args[$i]#--branch=}"
+        break
+        ;;
+    esac
+  done
+  if [ -n "$name" ] && ! _gx_branch_create_ok "$name"; then
+    echo -e "\033[1;31m[Error]\033[0m Invalid branch name: \033[1;33m${name}\033[0m" >&2
+    echo "  Expect: type/TICKET-ID  e.g. feat/ABC-123" >&2
+    echo "  Or base/scratch: develop uat qa staging prod tmp …" >&2
+    return 1
+  fi
+  git checkout "$@"
+}
+
+cmd_db() {
+  local current base
+  current=$(git branch --show-current)
+  base="$(_gx_base_branch)"
+  local branches
+  branches=$(git branch | sed 's/^[* ] //' | grep -v "^${base}$" | grep -v "^${current}$" || true)
+  if [ -z "$branches" ]; then
+    echo -e "\033[1;34m[Info]\033[0m No branches to delete."
+    return 0
+  fi
+  echo "$branches" | xargs git branch -D
+}
+
+cmd_l() {
+  git log --pretty='%Cred%h%Creset -%C(auto)%d%Creset %s %Cgreen(%ar) %C(bold blue)<%an>%Creset' "$@"
+}
+
+cmd_lg() {
+  git log --graph --pretty='%Cred%h%Creset -%C(auto)%d%Creset %s %Cgreen(%ar) %C(bold blue)<%an>%Creset' --all "$@"
+}
+
+cmd_cc() {
+  local msg
+  msg=$(git log -1 --format=%s)
+  printf '%s' "$msg" | _gx_clip
+  echo -e "\033[1;32mCOPIED!\033[0m --> \033[1;33m${msg}\033[0m"
+}
+
+cmd_pr() {
+  local env="${1:-$(_gx_base_branch)}"
+  local force="${2:-}"
+  local clean_env
+  clean_env=$(echo "$env" | sed -e "s/--to=//" -e "s/\"//g")
+  local url
+  url=$(_pr_logic "$clean_env" "$force") || return 1
+  echo -e "\033[1;32mOpening PR flow for: \033[1;35m${clean_env}\033[0m"
+  _open_url_browser "$url"
+}
+
+cmd_cpr() {
+  local target="${1:-$(_gx_base_branch)}"
+  local url
+  url=$(_pr_logic "$target") || return 1
+  printf '%s' "$url" | _gx_clip
+  echo -e "\033[1;32mCOPIED PR to \033[1;35m$target\033[1;32m!\033[0m"
+}
+
+cmd_cp() {
+  local raw=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -m|--message)
+        shift
+        raw="${1:-}"
+        shift || true
+        ;;
+      --message=*)
+        raw="${1#--message=}"
+        shift
+        ;;
+      -m*)
+        raw="${1#-m}"
+        shift
+        ;;
+      -h|--help)
+        echo "Usage: gx cp -m \"message\"   # add? → commit → f → p -f → pr"
+        return 0
+        ;;
+      *)
+        # backward-compatible: gx cp "message"
+        if [ -z "$raw" ]; then
+          raw="$1"
+          shift
+        else
+          echo -e "\033[1;31m[Error]\033[0m Unknown argument: $1" >&2
+          return 1
+        fi
+        ;;
+    esac
+  done
+  if [ -z "$raw" ]; then
+    echo -e "\033[1;31m[Error]\033[0m Usage: gx cp -m \"commit message\"" >&2
+    return 1
+  fi
+  _smart_add
+  local msg
+  msg="$(_build_commit_msg_from_branch "$raw")"
+
+  git commit -m "$msg" --no-verify \
+    && echo -e "\033[1;32mNew commit: \033[1;33m$(git log -1 --format=%s)\033[0m" \
+    && cmd_f \
+    && cmd_p -f \
+    && cmd_pr
+}
+
+cmd_cap() {
+  _smart_add && cmd_c --amend && cmd_f && cmd_p -f && cmd_pr
+}
+
+cmd_sp() {
+  git submodule update --recursive "$@"
+}
+
+cmd_spnew() {
+  git submodule update --init --remote --recursive "$@"
+}
+
+cmd_t() {
+  local ENV="${1:-$(_gx_get tag_env core-qa)}"
+
+  if [ -z "${1:-}" ]; then
+    echo -e "\033[1;31m[WARNING]:\033[0m No environment provided. Using default: \033[1;33m$ENV\033[0m"
+  fi
+
+  local LATEST_TAG
+  LATEST_TAG=$(git tag -l "$ENV-v*" --sort=-v:refname | head -n 1)
+
+  if [ -z "$LATEST_TAG" ]; then
+    echo -e "Error: No tag found matching the pattern \033[1;33m$ENV-v*\033[0m."
+    return 1
+  fi
+
+  echo -e "Latest tag found: \033[1;33m$LATEST_TAG\033[0m"
+
+  local CONFIRM
+  read -r -p "$(echo -e "Are you sure you want to \033[1;31mFORCE RE-CREATE and PUSH\033[0m tag \033[1;33m$LATEST_TAG\033[0m? (y/N): ")" CONFIRM
+  if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then
+    echo -e "Re-creating tag \033[1;33m$LATEST_TAG\033[0m..."
+    git tag -d "$LATEST_TAG" 2>/dev/null || true
+    git push --no-verify origin :refs/tags/"$LATEST_TAG" 2>/dev/null || true
+    if git tag "$LATEST_TAG" && git push --no-verify origin "$LATEST_TAG"; then
+      echo -e "\033[1;32mSuccess!\033[0m"
+    else
+      echo -e "\033[1;31mError occurred.\033[0m"
+    fi
+  else
+    echo "Aborted."
+  fi
+}
+
+cmd_tn() {
+  local ENV="${1:-$(_gx_get tag_env core-qa)}"
+  local MODE="${2:-}"
+
+  if [ -z "${1:-}" ]; then
+    echo -e "\033[1;31m[WARNING]:\033[0m No environment provided. Using default: \033[1;33m$ENV\033[0m"
+  fi
+
+  local LATEST_TAG
+  LATEST_TAG=$(git tag -l "$ENV-v*" --sort=-v:refname | head -n 1)
+
+  if [ -z "$LATEST_TAG" ]; then
+    echo -e "Error: No tag found for $ENV."
+    return 1
+  fi
+
+  local NEW_TAG=""
+  if [[ "$MODE" == "hf" ]]; then
+    if [[ "$LATEST_TAG" == *"hotfix"* ]]; then
+      local base num
+      base=$(echo "$LATEST_TAG" | sed -E "s/(.*hotfix)([0-9]+)/\1/")
+      num=$(echo "$LATEST_TAG" | sed -E "s/.*hotfix([0-9]+)/\1/")
+      NEW_TAG="${base}$((num + 1))"
+    else
+      NEW_TAG="${LATEST_TAG}.hotfix1"
+    fi
+  else
+    local CLEAN_TAG BASE BUILD
+    CLEAN_TAG=$(echo "$LATEST_TAG" | sed -E "s/\.hotfix[0-9]+//")
+    BASE="${CLEAN_TAG%.*}"
+    BUILD="${CLEAN_TAG##*.}"
+    NEW_TAG="${BASE}.$((BUILD + 1))"
+  fi
+
+  echo -e "Old tag: \033[1;33m$LATEST_TAG\033[0m"
+  echo -e "New tag: \033[1;32m$NEW_TAG\033[0m"
+
+  local CONFIRM
+  read -r -p "Create and push? (y/N): " CONFIRM
+  if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then
+    git tag "$NEW_TAG" && git push --no-verify origin "$NEW_TAG"
+  else
+    echo "Aborted."
+  fi
+}
+
+cmd_tver() {
+  if [ -z "${1:-}" ]; then
+    echo "Error: Syntax: gx tver [full-tag-name]"
+    return 1
+  fi
+
+  local NEW_TAG="$1"
+
+  if ! echo "$NEW_TAG" | grep -E -q '^[a-zA-Z0-9-]+-v[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(\.hotfix[0-9]+)?$'; then
+    echo -e "\033[1;31mError: Invalid format.\033[0m"
+    return 1
+  fi
+
+  echo -e "Target tag: \033[1;33m$NEW_TAG\033[0m"
+
+  local CONFIRM
+  read -r -p "Are you sure? (y/N): " CONFIRM
+  if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then
+    git tag -f "$NEW_TAG" && git push --no-verify origin "$NEW_TAG" -f
+  else
+    echo "Aborted."
+  fi
+}
+
+cmd_docs() {
+  local lang="${1:-en}"
+  case "$lang" in
+    -h|--help|help|h)
+      cat <<'EOF'
+gx docs [en|vi|ja]
+
+  Open the detailed usage guide.
+  Opens the online guide by default:
+    https://github.com/phamlehoan/git-express/blob/main/docs/
+
+  gx docs          English (default)
+  gx docs vi       Vietnamese
+  gx docs ja       Japanese
+
+  Override base URL:
+    gx cfg global set docs_url 'https://…/docs'
+EOF
+      return 0
+      ;;
+  esac
+
+  echo -e "\033[1;34m[Docs]\033[0m Usage guide (${lang})"
+  _gx_print_docs_links "$lang"
+
+  local url file
+  if url="$(_gx_docs_web_url "$lang" 2>/dev/null)"; then
+    echo -e "\033[1;36m[Open]\033[0m $url"
+    _gx_open_path_or_url "$url"
+    return 0
+  fi
+  if file="$(_gx_docs_file "$lang" 2>/dev/null)"; then
+    echo -e "\033[1;36m[Open]\033[0m $file"
+    _gx_open_path_or_url "$file"
+    return 0
+  fi
+  echo -e "\033[1;31m[Error]\033[0m Docs not found. Re-run ./install.sh or set docs_url." >&2
+  return 1
+}
+
+cmd_h() {
+  local B=$'\033[1m'      # bold
+  local C=$'\033[1;36m'  # cyan section
+  local G=$'\033[1;32m'  # green command
+  local Y=$'\033[1;33m'  # yellow arg / tip
+  local D=$'\033[2m'     # dim
+  local R=$'\033[0m'
+
+  cat <<EOF
+${B}gx${R} ${D}v${GX_VERSION}${R} — Git Express
+  ${D}Ticket-driven Git, from branch to PR.${R}
+  ${D}Conventional commits. Rebase before PR.${R}
+  ${D}One CLI. Clean history.${R}
+  ${D}Short commands. Strict conventions.${R}
+
+${C}USAGE${R}
+  gx <command> [args...]
+  gx h | gx -h | gx --help     Show this help
+  gx docs [en|vi|ja]           Open detailed usage guide
+  gx -v | gx --version         Print version
+
+${C}QUICK START${R}
+  1. Install gx (see README), then open a git repo.
+  2. Optional:  ${G}gx cfg init${R}  then set browser / branch aliases.
+  3. Daily flow:
+       ${G}gx a${R}                        Stage all (honors excludes)
+       ${G}gx c -m${R} "fix login bug"    Commit (auto-format from branch)
+       ${G}gx f${R}                        Rebase onto base branch
+       ${G}gx p${R}                        Push current branch
+       ${G}gx pr${R}                       Open create-PR page in browser
+
+  Or one shot:  ${G}gx cp -m${R} "fix login bug"   → add → commit → rebase → push → PR
+
+${C}STAGE / COMMIT / BRANCH${R}
+  ${G}gx a${R}                        Stage all changes (${Y}git add .${R}).
+                               After add, unstages paths from ${Y}gx cfg exclude${R}.
+
+  ${G}gx c -m${R} ${Y}"message"${R}         New commit (${Y}--no-verify${R}), auto-format:
+                                 Branch ${Y}type/TICKET-ID${R} + ${Y}-m "AddLoginFilter"${R}
+                                   → ${Y}type: add_login_filter (ticket-id)${R}
+                                 ${Y}TICKET-ID${R} = issue tracker ticket code (e.g. ABC-123).
+                                 camelCase → snake_case; spaces kept.
+                                 Always skips hooks so gx stays the fast path.
+
+  ${G}gx c${R} / ${G}gx c --amend${R}         Amend last commit, keep message.
+  ${G}gx c --amend -m${R} ${Y}"message"${R} Amend with new auto-formatted message.
+  ${G}gx ca${R}                       Shortcut for ${G}gx c --amend${R}.
+
+  ${G}gx co${R} ${Y}<branch>${R}             Checkout branch (passes args to ${Y}git checkout${R}).
+
+  ${G}gx db${R}                       Delete local branches except current and
+                               configured base (${Y}gx cfg${R} key ${Y}base${R}, default develop).
+
+${C}HOOKS${R} ${D}(opt-in per repo — no Node)${R}
+  ${G}gx hooks on${R}                 Install hooks for ${B}plain git / VS Code only${R}:
+                                 · create branch: ${Y}type/TICKET-ID${R} or bases
+                                   (develop uat qa staging prod tmp …)
+                                 · commit: ${B}auto-format${R} like ${G}gx c -m${R}
+                                   (must be on ${Y}type/TICKET-ID${R})
+                                 · push/tag: SemVer ${Y}<env>-vX.Y.Z.N${R}
+                               All ${G}gx${R} commands skip hooks (${Y}GX_SKIP_HOOKS${R}
+                               + ${Y}--no-verify${R}) — no wasted time on the gx path.
+  ${G}gx hooks off${R}                Remove gx-managed hooks (restore backups if any).
+  ${G}gx hooks status${R}             Show whether hooks are enabled.
+
+${C}SYNC / PUSH / SUBMODULES${R}
+  ${G}gx f${R} [${Y}branch${R}]              Fetch + rebase onto ${Y}branch${R} (default: cfg ${Y}base${R}).
+                               Stashes dirty worktree if needed, restores after.
+                               Deletes local copy of target branch before fetch
+                               (to refresh from origin).
+
+  ${G}gx p${R} [${Y}git-push-args...${R}]    Push current branch to ${Y}origin${R}.
+                               Extra args are forwarded (e.g. ${Y}gx p -f${R}).
+
+  ${G}gx sp${R}                       ${Y}git submodule update --recursive${R}
+
+  ${G}gx spnew${R}                    ${Y}git submodule update --init --remote --recursive${R}
+
+${C}LOG${R}
+  ${G}gx l${R} [${Y}git-log-args...${R}]     Pretty log (one line per commit).
+                               Example: ${Y}gx l -5${R}
+
+  ${G}gx lg${R} [${Y}git-log-args...${R}]    Same, with graph, all branches.
+
+${C}PULL REQUEST${R}
+  PR URL is ${B}auto-inferred from${R} ${Y}git remote origin${R}:
+    GitHub · GitLab · Bitbucket · Azure DevOps · AWS CodeCommit · Nulab Backlog
+  Optional override: ${Y}gx cfg set pr_template '…'${R}
+
+  ${G}gx pr${R} [${Y}env${R}] [${Y}-f${R}]         Open create-PR page in browser.
+  ${G}gx cpr${R} [${Y}env${R}]               Copy PR URL to clipboard (no browser).
+
+                               ${Y}env${R} = target alias or branch name
+                                 (default: cfg ${Y}base${R}, usually develop).
+                               Mapped via ${Y}gx cfg branch <alias> <branch>${R}.
+                               ${Y}protect.<alias>${R} forces PR ${B}source${R} branch
+                                 unless you pass ${Y}-f${R} (use current branch).
+
+  Examples:
+    ${G}gx pr${R}                     current → base
+    ${G}gx pr qa${R}                  current → branch.qa (e.g. release)
+    ${G}gx pr qa -f${R}               force source = current branch
+    ${G}gx cpr develop${R}            copy URL only
+
+  Browser: cfg ${Y}browser${R} = default | chrome | edge | coccoc
+
+${C}ONE-SHOT FLOWS${R}
+  ${G}gx cp -m${R} ${Y}"message"${R}        If nothing staged → ${G}gx a${R}.
+                               Then commit → ${G}gx f${R} → ${G}gx p -f${R} → ${G}gx pr${R}.
+
+  ${G}gx cap${R}                      If nothing staged → ${G}gx a${R}.
+                               Then ${G}gx c --amend${R} → ${G}gx f${R} → ${G}gx p -f${R} → ${G}gx pr${R}.
+
+  ${G}gx cc${R}                       Copy latest commit subject to clipboard
+                               (handy for PR title).
+
+${C}TAGS${R}
+  Tag pattern: ${Y}<env>-vX.Y.Z.N${R}  optional ${Y}.hotfixN${R}
+  Default ${Y}env${R}: cfg ${Y}tag_env${R} (default ${Y}core-qa${R}).
+
+  ${G}gx t${R} [${Y}env${R}]                Find latest ${Y}env-v*${R} tag, confirm, then
+                               delete local+remote and re-create + push
+                               (force refresh same tag).
+
+  ${G}gx tn${R} [${Y}env${R}] [${Y}hf${R}]         Bump last number (+1), or with ${Y}hf${R}
+                               create/bump ${Y}.hotfixN${R}. Confirm then push.
+
+  ${G}gx tver${R} ${Y}<full-tag>${R}         Create/force-push an explicit tag name.
+                               Example: ${Y}gx tver core-qa-v5.3.7.0${R}
+
+${C}CONFIG${R}
+  Stored per repo under ${Y}~/.config/gx/projects/<hash>.conf${R}
+  (override dir: env ${Y}GX_CONFIG_DIR${R}).
+
+  ${G}gx cfg${R}                      Show this repo's config
+  ${G}gx cfg init${R}                 Create default config for current repo
+  ${G}gx cfg list${R}                 List remembered projects
+  ${G}gx cfg set${R} ${Y}<key> <value>${R}   Set project key
+  ${G}gx cfg get${R} / ${G}unset${R} ${Y}<key>${R}
+  ${G}gx cfg branch${R} ${Y}<alias> <branch>${R}   Map PR env → target branch
+  ${G}gx cfg protect${R} ${Y}<alias> <branch>${R}  Default PR source (skip with -f)
+  ${G}gx cfg exclude add|rm|list${R} ${Y}<path>${R}
+  ${G}gx cfg global set|get|unset|show${R}
+  ${G}gx cfg path${R} / ${G}edit${R}         File path / open in \$EDITOR
+
+  Common keys: ${Y}base${R} · ${Y}browser${R} · ${Y}tag_env${R} · ${Y}repo_name${R} · ${Y}pr_template${R} · ${Y}docs_url${R}
+
+  Full config help:  ${G}gx cfg help${R}
+  Full usage guide:  ${G}gx docs${R}
+
+${C}CONVENTIONS${R}
+  Ticket-driven branch/commit style, aligned with:
+
+    Conventional Branch
+      https://conventional-branch.github.io/
+      Branch:  ${Y}<type>/<TICKET-ID>${R}   e.g. ${Y}feat/ABC-123${R}
+      ${Y}TICKET-ID${R} = ticket / issue ID from your tracker
+
+    Conventional Commits
+      https://www.conventionalcommits.org/
+      ${G}gx c -m${R} "AddLoginFilter" → ${Y}feat: add_login_filter (abc-123)${R}
+      ${G}gx c${R} / ${G}--amend${R} = amend; ${G}--amend -m${R} = amend + new message
+
+    Semantic Versioning
+      https://semver.org/
+      Tags:  ${Y}<env>-vX.Y.Z.N${R}  (+ optional ${Y}.hotfixN${R})
+
+  Branch is the single source of truth for type + ticket (DRY).
+  Workflow: feature branch + rebase-before-PR; optional env promotion
+  (cfg ${Y}branch${R} / ${Y}protect${R}) ≈ GitLab Flow
+    https://docs.gitlab.com/ee/topics/gitlab_flow.html
+
+${C}EXAMPLES${R}
+  ${D}# feature branch: feat/ABC-123  (ABC-123 = ticket ID)${R}
+  ${G}gx co -b${R} feat/ABC-123
+  ${G}gx a${R}
+  ${G}gx c -m${R} "AddLoginFilter"    ${D}→ feat: add_login_filter (abc-123)${R}
+  ${G}gx f${R}
+  ${G}gx p${R}
+  ${G}gx pr qa${R}
+
+  ${D}# or all-in-one${R}
+  ${G}gx cp -m${R} "AddLoginFilter"
+
+  ${D}# amend${R}
+  ${G}gx c${R}                         ${D}# keep message${R}
+  ${G}gx c --amend -m${R} "NewText"    ${D}# change message${R}
+
+${C}NOTES${R}
+  • Run commands inside a git repository (except ${G}gx h${R} / ${G}gx docs${R} / version).
+  • PR host is whatever ${Y}origin${R} points to — push first if the branch is new.
+  • For unsupported remotes, set ${Y}pr_template${R} with placeholders
+    ${Y}{source}${R} ${Y}{target}${R} ${Y}{source_raw}${R} ${Y}{target_raw}${R} ${Y}{repo}${R}.
+
+${C}DOCUMENTATION${R}
+  Detailed guide (Ctrl+click / open with ${G}gx docs${R}):
+EOF
+  # Print live links after the heredoc (paths depend on install)
+  _gx_print_docs_links en
+  echo ""
+  echo -e "  ${D}Also: gx docs vi · gx docs ja${R}"
+  echo ""
+}
+
+cmd_version() {
+  echo "gx ${GX_VERSION}"
+}
+
+# ---------------------------------------------------------------------------
+# Dispatcher
+# ---------------------------------------------------------------------------
+usage_error() {
+  echo -e "\033[1;31m[Error]\033[0m Unknown command: ${1:-}" >&2
+  echo "Run 'gx h' for help." >&2
+  exit 1
+}
+
+main() {
+  # gx path never runs project hooks (reference-transaction / commit-msg / pre-push).
+  export GX_SKIP_HOOKS=1
+
+  local cmd="${1:-h}"
+  shift || true
+
+  case "$cmd" in
+    a|add)       cmd_a "$@" ;;
+    c|commit)    cmd_c "$@" ;;
+    ca|amend)    cmd_ca "$@" ;;
+    f|fetch|rebase) cmd_f "$@" ;;
+    p|push)      cmd_p "$@" ;;
+    co|checkout) cmd_co "$@" ;;
+    db)          cmd_db "$@" ;;
+    l|log)       cmd_l "$@" ;;
+    lg|graph)    cmd_lg "$@" ;;
+    cc)          cmd_cc "$@" ;;
+    pr)          cmd_pr "$@" ;;
+    cpr)         cmd_cpr "$@" ;;
+    cp)          cmd_cp "$@" ;;
+    cap)         cmd_cap "$@" ;;
+    sp)          cmd_sp "$@" ;;
+    spnew)       cmd_spnew "$@" ;;
+    t)           cmd_t "$@" ;;
+    tn)          cmd_tn "$@" ;;
+    tver)        cmd_tver "$@" ;;
+    cfg|config)  cmd_cfg "$@" ;;
+    docs|doc|manual|man) cmd_docs "$@" ;;
+    hooks|hook)  cmd_hooks "$@" ;;
+    h|help|-h|--help) cmd_h "$@" ;;
+    -v|--version|version) cmd_version ;;
+    *)           usage_error "$cmd" ;;
+  esac
+}
+
+# Only run when executed, not when sourced
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -z "${BASH_SOURCE[0]:-}" ]]; then
+  main "$@"
+fi

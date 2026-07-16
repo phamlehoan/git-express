@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# gx pre-push — branch + SemVer tags for plain git push
+# Skipped when GX_SKIP_HOOKS=1 (gx) or git push --no-verify
+
+set -euo pipefail
+
+HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=gx-validate.sh
+. "$HOOK_DIR/gx-validate.sh"
+
+_gx_hook_skip_if_gx && exit 0
+
+ZERO="$GX_HOOK_ZERO"
+failed=0
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ -z "${local_ref:-}" ] && continue
+  if [ "$local_sha" = "$ZERO" ]; then
+    continue
+  fi
+
+  case "$local_ref" in
+    refs/heads/*)
+      branch="${local_ref#refs/heads/}"
+      if ! _gx_hook_branch_push_ok "$branch"; then
+        _gx_hook_print_branch_push_error "$branch"
+        failed=1
+      fi
+      ;;
+    refs/tags/*)
+      tag="${local_ref#refs/tags/}"
+      if ! _gx_hook_tag_ok "$tag"; then
+        _gx_hook_print_tag_error "$tag"
+        failed=1
+      fi
+      ;;
+  esac
+done
+
+if [ "$failed" -ne 0 ]; then
+  echo -e "\033[1;31m[gx hooks]\033[0m Push blocked." >&2
+  echo "  Tip: use gx p / gx tn / gx tver (skips hooks), or fix the name." >&2
+  exit 1
+fi
+
+exit 0

@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# gx commit-msg — auto-format Conventional Commits from branch (like gx c -m)
+# Also requires type/TICKET-ID branch for non-merge commits.
+# Skipped when GX_SKIP_HOOKS=1 (gx) or git commit --no-verify
+
+set -euo pipefail
+
+HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=gx-validate.sh
+. "$HOOK_DIR/gx-validate.sh"
+
+_gx_hook_skip_if_gx && exit 0
+
+MSG_FILE="${1:-}"
+if [ -z "$MSG_FILE" ] || [ ! -f "$MSG_FILE" ]; then
+  echo "gx hooks: missing commit message file" >&2
+  exit 1
+fi
+
+# First non-comment, non-empty line = subject
+MSG=$(grep -v '^#' "$MSG_FILE" | sed '/^[[:space:]]*$/d' | head -n 1 || true)
+
+if [ -z "$MSG" ]; then
+  echo "" >&2
+  echo -e "\033[1;31m[gx hooks]\033[0m Empty commit message." >&2
+  echo "  Type a short message (e.g. AddLoginFilter) — hooks will format it." >&2
+  echo "" >&2
+  exit 1
+fi
+
+# Leave git-generated subjects alone
+case "$MSG" in
+  Merge\ *|Revert\ *|fixup!\ *|squash!\ *)
+    exit 0
+    ;;
+esac
+
+BRANCH="$(git branch --show-current 2>/dev/null || true)"
+if ! _gx_hook_branch_commit_ok "$BRANCH"; then
+  _gx_hook_print_branch_commit_error "${BRANCH:-detached}"
+  exit 1
+fi
+
+RAW="$(_gx_hook_extract_raw_subject "$MSG")"
+if [ -z "$RAW" ]; then
+  echo "" >&2
+  echo -e "\033[1;31m[gx hooks]\033[0m Empty description after parsing commit message." >&2
+  echo "" >&2
+  exit 1
+fi
+
+FORMATTED="$(_gx_hook_build_commit_msg "$RAW")"
+
+# Preserve body (non-comment lines after the subject) and comment lines from the file
+{
+  printf '%s\n' "$FORMATTED"
+  # Body: non-comment content after the first subject line
+  awk '
+    BEGIN { seen=0; body=0 }
+    /^#/ { print; next }
+    /^[[:space:]]*$/ {
+      if (seen) { print; body=1 }
+      next
+    }
+    {
+      if (!seen) { seen=1; next }
+      print
+      body=1
+    }
+  ' "$MSG_FILE"
+} >"${MSG_FILE}.gx-tmp"
+mv "${MSG_FILE}.gx-tmp" "$MSG_FILE"
+
+if [ "$FORMATTED" != "$MSG" ]; then
+  echo -e "\033[1;32m[gx hooks]\033[0m Formatted commit message:" >&2
+  echo -e "  \033[2m${MSG}\033[0m" >&2
+  echo -e "  → \033[1;33m${FORMATTED}\033[0m" >&2
+fi
+
+exit 0
