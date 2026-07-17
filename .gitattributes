@@ -1,0 +1,15 @@
+# Force LF for shell scripts so macOS / Linux / Git Bash run correctly.
+# (CRLF breaks shebang: "bash\r: No such file or directory")
+
+* text=auto
+
+bin/gx text eol=lf
+*.sh text eol=lf
+hooks/** text eol=lf
+uninstall.sh text eol=lf
+
+# PowerShell is fine with CRLF on Windows
+*.ps1 text eol=crlf
+
+*.md text eol=lf
+*.svg text eol=lf
