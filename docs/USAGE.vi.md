@@ -438,7 +438,7 @@ gx cfg help
 | Host | Dạng |
 |------|------|
 | GitHub | `…/compare/{target}...{source}?expand=1` |
-| GitLab | `…/-/merge_requests/new?…` |
+| GitLab | `…/merge_requests/new?…` |
 | Bitbucket | `…/pull-requests/new?…` |
 | Azure DevOps | `…/pullrequestcreate?…` |
 | AWS CodeCommit | URL console; **region** từ `git-codecommit.REGION.amazonaws.com` |

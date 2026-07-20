@@ -104,7 +104,7 @@ gx cfg                            # 設定を表示
 | ホスト | PR URL の形 |
 |--------|-------------|
 | GitHub | `…/compare/{target}...{source}?expand=1` |
-| GitLab | `…/-/merge_requests/new?…source_branch…` |
+| GitLab | `…/merge_requests/new?…source_branch…` |
 | Bitbucket | `…/pull-requests/new?source=…&dest=…` |
 | Azure DevOps | `…/pullrequestcreate?sourceRef=…` |
 | AWS CodeCommit | コンソール URL（リージョンは remote から） |

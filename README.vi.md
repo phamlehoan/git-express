@@ -104,7 +104,7 @@ gx cfg                            # xem config
 | Host | Dạng URL tạo PR |
 |------|-----------------|
 | GitHub | `…/compare/{target}...{source}?expand=1` |
-| GitLab | `…/-/merge_requests/new?…source_branch…` |
+| GitLab | `…/merge_requests/new?…source_branch…` |
 | Bitbucket | `…/pull-requests/new?source=…&dest=…` |
 | Azure DevOps | `…/pullrequestcreate?sourceRef=…` |
 | AWS CodeCommit | URL console (region lấy từ remote) |

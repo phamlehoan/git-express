@@ -438,7 +438,7 @@ gx cfg help
 | Host | Shape |
 |------|--------|
 | GitHub | `…/compare/{target}...{source}?expand=1` |
-| GitLab | `…/-/merge_requests/new?…` |
+| GitLab | `…/merge_requests/new?…` |
 | Bitbucket | `…/pull-requests/new?…` |
 | Azure DevOps | `…/pullrequestcreate?…` |
 | AWS CodeCommit | Console URL; **region** from `git-codecommit.REGION.amazonaws.com` |
